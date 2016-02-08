@@ -36,15 +36,22 @@ type create struct {
 	*flags.HostSystemFlag
 	*flags.NetworkFlag
 
+	name       string
 	memory     int
 	cpus       int
 	guestID    string
 	link       bool
 	on         bool
 	force      bool
-	iso        string
-	disk       string
 	controller string
+
+	iso              string
+	isoDatastoreFlag *flags.DatastoreFlag
+	isoDatastore     *object.Datastore
+
+	disk              string
+	diskDatastoreFlag *flags.DatastoreFlag
+	diskDatastore     *object.Datastore
 
 	Client       *vim25.Client
 	Datacenter   *object.Datacenter
@@ -82,9 +89,15 @@ func (cmd *create) Register(ctx context.Context, f *flag.FlagSet) {
 	f.BoolVar(&cmd.link, "link", true, "Link specified disk")
 	f.BoolVar(&cmd.on, "on", true, "Power on VM. Default is true if -disk argument is given.")
 	f.BoolVar(&cmd.force, "force", false, "Create VM if vmx already exists")
-	f.StringVar(&cmd.iso, "iso", "", "Path to ISO")
 	f.StringVar(&cmd.controller, "disk.controller", "scsi", "Disk controller type")
-	f.StringVar(&cmd.disk, "disk", "", "Disk path name")
+
+	f.StringVar(&cmd.iso, "iso", "", "ISO path")
+	cmd.isoDatastoreFlag, ctx = flags.NewCustomDatastoreFlag(ctx)
+	f.StringVar(&cmd.isoDatastoreFlag.Name, "iso-datastore", "", "Datastore for ISO file")
+
+	f.StringVar(&cmd.disk, "disk", "", "Disk path")
+	cmd.diskDatastoreFlag, ctx = flags.NewCustomDatastoreFlag(ctx)
+	f.StringVar(&cmd.diskDatastoreFlag.Name, "disk-datastore", "", "Datastore for disk file")
 }
 
 func (cmd *create) Process(ctx context.Context) error {
@@ -106,6 +119,15 @@ func (cmd *create) Process(ctx context.Context) error {
 	if err := cmd.NetworkFlag.Process(ctx); err != nil {
 		return err
 	}
+
+	// Default iso/disk datastores to the VM's datastore
+	if cmd.isoDatastoreFlag.Name == "" {
+		cmd.isoDatastoreFlag = cmd.DatastoreFlag
+	}
+	if cmd.diskDatastoreFlag.Name == "" {
+		cmd.diskDatastoreFlag = cmd.DatastoreFlag
+	}
+
 	return nil
 }
 
@@ -113,6 +135,11 @@ func (cmd *create) Run(ctx context.Context, f *flag.FlagSet) error {
 	var err error
 
 	if len(f.Args()) != 1 {
+		return flag.ErrHelp
+	}
+
+	cmd.name = f.Arg(0)
+	if cmd.name == "" {
 		return flag.ErrHelp
 	}
 
@@ -147,16 +174,33 @@ func (cmd *create) Run(ctx context.Context, f *flag.FlagSet) error {
 		}
 	}
 
-	for _, file := range []*string{&cmd.iso, &cmd.disk} {
-		if *file != "" {
-			_, err = cmd.Datastore.Stat(context.TODO(), *file)
-			if err != nil {
-				return err
-			}
+	// Verify ISO exists
+	if cmd.iso != "" {
+		_, err = cmd.isoDatastoreFlag.Stat(context.TODO(), cmd.iso)
+		if err != nil {
+			return err
+		}
+
+		cmd.isoDatastore, err = cmd.isoDatastoreFlag.Datastore()
+		if err != nil {
+			return err
 		}
 	}
 
-	task, err := cmd.createVM(f.Arg(0))
+	// Verify disk exists
+	if cmd.disk != "" {
+		_, err = cmd.diskDatastoreFlag.Stat(context.TODO(), cmd.disk)
+		if err != nil {
+			return err
+		}
+
+		cmd.diskDatastore, err = cmd.diskDatastoreFlag.Datastore()
+		if err != nil {
+			return err
+		}
+	}
+
+	task, err := cmd.createVM(context.TODO())
 	if err != nil {
 		return err
 	}
@@ -167,10 +211,6 @@ func (cmd *create) Run(ctx context.Context, f *flag.FlagSet) error {
 	}
 
 	vm := object.NewVirtualMachine(cmd.Client, info.Result.(types.ManagedObjectReference))
-
-	if err := cmd.addDevices(vm); err != nil {
-		return err
-	}
 
 	if cmd.on {
 		task, err := vm.PowerOn(context.TODO())
@@ -187,88 +227,114 @@ func (cmd *create) Run(ctx context.Context, f *flag.FlagSet) error {
 	return nil
 }
 
-func (cmd *create) addDevices(vm *object.VirtualMachine) error {
-	devices, err := vm.Device(context.TODO())
-	if err != nil {
-		return err
-	}
+func (cmd *create) createVM(ctx context.Context) (*object.Task, error) {
+	var devices object.VirtualDeviceList
+	var err error
 
-	var add []types.BaseVirtualDevice
-
-	if cmd.disk != "" {
-		controller, err := devices.FindDiskController(cmd.controller)
-		if err != nil {
-			return err
-		}
-
-		disk := devices.CreateDisk(controller, cmd.Datastore.Path(cmd.disk))
-
-		if cmd.link {
-			disk = devices.ChildDisk(disk)
-		}
-
-		add = append(add, disk)
-	}
-
-	if cmd.iso != "" {
-		ide, err := devices.FindIDEController("")
-		if err != nil {
-			return err
-		}
-
-		cdrom, err := devices.CreateCdrom(ide)
-		if err != nil {
-			return err
-		}
-
-		add = append(add, devices.InsertIso(cdrom, cmd.Datastore.Path(cmd.iso)))
-	}
-
-	netdev, err := cmd.NetworkFlag.Device()
-	if err != nil {
-		return err
-	}
-
-	add = append(add, netdev)
-
-	return vm.AddDevice(context.TODO(), add...)
-}
-
-func (cmd *create) createVM(name string) (*object.Task, error) {
 	spec := types.VirtualMachineConfigSpec{
-		Name:     name,
+		Name:     cmd.name,
 		GuestId:  cmd.guestID,
 		Files:    &types.VirtualMachineFileInfo{VmPathName: fmt.Sprintf("[%s]", cmd.Datastore.Name())},
 		NumCPUs:  cmd.cpus,
 		MemoryMB: int64(cmd.memory),
 	}
 
-	if !cmd.force {
-		vmxPath := fmt.Sprintf("%s/%s.vmx", name, name)
+	devices, err = cmd.addStorage(nil)
+	if err != nil {
+		return nil, err
+	}
 
-		_, err := cmd.Datastore.Stat(context.TODO(), vmxPath)
+	devices, err = cmd.addNetwork(devices)
+	if err != nil {
+		return nil, err
+	}
+
+	deviceChange, err := devices.ConfigSpec(types.VirtualDeviceConfigSpecOperationAdd)
+	if err != nil {
+		return nil, err
+	}
+
+	spec.DeviceChange = deviceChange
+
+	if !cmd.force {
+		vmxPath := fmt.Sprintf("%s/%s.vmx", cmd.name, cmd.name)
+
+		_, err := cmd.Datastore.Stat(ctx, vmxPath)
 		if err == nil {
 			dsPath := cmd.Datastore.Path(vmxPath)
 			return nil, fmt.Errorf("File %s already exists", dsPath)
 		}
 	}
 
-	if cmd.controller != "ide" {
-		scsi, err := object.SCSIControllerTypes().CreateSCSIController(cmd.controller)
-		if err != nil {
-			return nil, err
-		}
-
-		spec.DeviceChange = append(spec.DeviceChange, &types.VirtualDeviceConfigSpec{
-			Operation: types.VirtualDeviceConfigSpecOperationAdd,
-			Device:    scsi,
-		})
-	}
-
-	folders, err := cmd.Datacenter.Folders(context.TODO())
+	folders, err := cmd.Datacenter.Folders(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	return folders.VmFolder.CreateVM(context.TODO(), spec, cmd.ResourcePool, cmd.HostSystem)
+	return folders.VmFolder.CreateVM(ctx, spec, cmd.ResourcePool, cmd.HostSystem)
+}
+
+func (cmd *create) addStorage(devices object.VirtualDeviceList) (object.VirtualDeviceList, error) {
+	if cmd.controller != "ide" {
+		scsi, err := devices.CreateSCSIController(cmd.controller)
+		if err != nil {
+			return nil, err
+		}
+
+		devices = append(devices, scsi)
+	}
+
+	// If controller is specified to be IDE or if an ISO is specified, add IDE controller.
+	if cmd.controller == "ide" || cmd.iso != "" {
+		ide, err := devices.CreateIDEController()
+		if err != nil {
+			return nil, err
+		}
+
+		devices = append(devices, ide)
+	}
+
+	if cmd.disk != "" {
+		controller, err := devices.FindDiskController(cmd.controller)
+		if err != nil {
+			return nil, err
+		}
+
+		ds := cmd.diskDatastore.Reference()
+		path := cmd.diskDatastore.Path(cmd.disk)
+		disk := devices.CreateDisk(controller, ds, path)
+
+		if cmd.link {
+			disk = devices.ChildDisk(disk)
+		}
+
+		devices = append(devices, disk)
+	}
+
+	if cmd.iso != "" {
+		ide, err := devices.FindIDEController("")
+		if err != nil {
+			return nil, err
+		}
+
+		cdrom, err := devices.CreateCdrom(ide)
+		if err != nil {
+			return nil, err
+		}
+
+		cdrom = devices.InsertIso(cdrom, cmd.isoDatastore.Path(cmd.iso))
+		devices = append(devices, cdrom)
+	}
+
+	return devices, nil
+}
+
+func (cmd *create) addNetwork(devices object.VirtualDeviceList) (object.VirtualDeviceList, error) {
+	netdev, err := cmd.NetworkFlag.Device()
+	if err != nil {
+		return nil, err
+	}
+
+	devices = append(devices, netdev)
+	return devices, nil
 }
